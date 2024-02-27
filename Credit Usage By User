@@ -1,0 +1,467 @@
+-- https://medium.com/@calep/snowflake-dashboard-credit-usage-by-user-dad01e1ae431
+
+-- Daily Credit and Average Daily Credit Usage
+
+--daily credit usage - current day
+with query_warehouse_usage as (
+    select
+        usg.start_time
+        ,usg.end_time
+        ,usg.user_name
+        ,usg.role_name
+        ,usg.warehouse_name
+        ,usg.warehouse_size
+        ,usg.total_elapsed_secs
+        ,usg.est_query_cost
+    from (
+        select 
+            qh.start_time
+            ,qh.end_time
+            ,to_char(qh.start_time, 'DD-MON-YYYY')::DATE as start_dt
+            ,to_char(qh.start_time, 'HH24:MI')::TIME as time_slot_min
+            ,to_time(to_char(qh.start_time, 'HH24') || ':00')::TIME as time_slot_hour
+            ,qh.user_name
+            ,qh.role_name
+            ,qh.warehouse_name
+            ,qh.warehouse_size
+            ,wmh.credits_used as total_vwh_credits_per_hour
+            ,round(qh.total_elapsed_time * 1000) as total_elapsed_secs
+            ,ceil(total_elapsed_secs / 60) as query_time_slots --query_time_slots: Number of 1 min slots taken by the query during this window
+            ,sum(query_time_slots) over (partition by qh.warehouse_name, time_slot_hour order by qh.warehouse_name, time_slot_hour) as total_time_slots --total_time_slots: Total Number 1 min slots across all parallel queries running during this window
+            ,query_time_slots / total_time_slots * 100 as est_query_cost_percent --est_query_cost_percent: This Query load on Warehouse during this window
+            ,total_vwh_credits_per_hour * est_query_cost_percent/100 as est_query_cost --est_query_cost: Based on est_query_cost_percent we will allocate WH cost % during this window
+        from snowflake.account_usage.query_history as qh
+        inner join snowflake.account_usage.warehouse_metering_history as wmh on qh.warehouse_id = wmh.warehouse_id
+        where qh.warehouse_size is not null
+        and qh.start_time < wmh.end_time
+        and qh.end_time > wmh.start_time
+        and qh.total_elapsed_time > 0
+        and qh.user_name = current_user()
+        and qh.start_time >= getdate()::date::timestamp --get daily metric only
+    ) as usg
+)
+,warehouse_usage_share as (
+    select 
+        start_time::DATE as query_date
+        ,warehouse_name
+        ,round(sum(est_query_cost), 2) as aprox_credits
+        ,1/count(distinct user_name) as unqiue_user_share
+    from query_warehouse_usage
+    group by start_time::DATE, warehouse_name
+)
+,warehouse_credits as (
+    select start_time::DATE as wh_date,
+    warehouse_name,
+    round(sum(credits_used), 2) as credits_used
+    from snowflake.account_usage.warehouse_metering_history
+    where warehouse_name <> 'CLOUD_SERVICES_ONLY'
+    group by start_time::DATE, warehouse_name
+)
+,warehouse_adjusted_usage as (
+    select 
+    whc.wh_date
+    ,whc.warehouse_name
+    ,whc.credits_used - whs.aprox_credits as gap
+    ,gap * unqiue_user_share as adjustperuser
+    from warehouse_credits as whc
+    inner join warehouse_usage_share as whs on whc.wh_date = whs.query_date
+    AND whc.warehouse_name = whs.warehouse_name
+)
+,query_adjusted_usage as (
+    select 
+        qwu.user_name
+        ,qwu.warehouse_name
+        ,qwu.start_time::DATE as query_date
+        ,round(sum(qwu.est_query_cost), 4) as aprox_credits
+    from query_warehouse_usage as qwu
+    group by qwu.user_name, qwu.warehouse_name, query_date
+)
+select 
+    sum(round(qau.aprox_credits + wau.adjustperuser, 4)) over (partition by qau.query_date, qau.warehouse_name, qau.user_name) AS total_credits
+from warehouse_adjusted_usage as wau
+join query_adjusted_usage as qau on wau.wh_date = qau.query_date
+and wau.warehouse_name = qau.warehouse_name
+order by query_date desc, total_credits desc
+;
+
+-- average daily credit usage
+with query_warehouse_usage as (
+    select
+        usg.start_time
+        ,usg.end_time
+        ,usg.user_name
+        ,usg.role_name
+        ,usg.warehouse_name
+        ,usg.warehouse_size
+        ,usg.total_elapsed_secs
+        ,usg.est_query_cost
+    from (
+        select 
+            qh.start_time
+            ,qh.end_time
+            ,to_char(qh.start_time, 'DD-MON-YYYY')::DATE as start_dt
+            ,to_char(qh.start_time, 'HH24:MI')::TIME as time_slot_min
+            ,to_time(to_char(qh.start_time, 'HH24') || ':00')::TIME as time_slot_hour
+            ,qh.user_name
+            ,qh.role_name
+            ,qh.warehouse_name
+            ,qh.warehouse_size
+            ,wmh.credits_used as total_vwh_credits_per_hour
+            ,round(qh.total_elapsed_time * 1000) as total_elapsed_secs
+            ,ceil(total_elapsed_secs / 60) as query_time_slots --query_time_slots: Number of 1 min slots taken by the query during this window
+            ,sum(query_time_slots) over (partition by qh.warehouse_name, time_slot_hour order by qh.warehouse_name, time_slot_hour) as total_time_slots --total_time_slots: Total Number 1 min slots across all parallel queries running during this window
+            ,query_time_slots / total_time_slots * 100 as est_query_cost_percent --est_query_cost_percent: This Query load on Warehouse during this window
+            ,total_vwh_credits_per_hour * est_query_cost_percent/100 as est_query_cost --est_query_cost: Based on est_query_cost_percent we will allocate WH cost % during this window
+        from snowflake.account_usage.query_history as qh
+        inner join snowflake.account_usage.warehouse_metering_history as wmh on qh.warehouse_id = wmh.warehouse_id
+        where qh.warehouse_size is not null
+        and qh.start_time < wmh.end_time
+        and qh.end_time > wmh.start_time
+        and qh.total_elapsed_time > 0
+        and qh.user_name = current_user()
+    ) as usg
+)
+,warehouse_usage_share as (
+    select 
+        start_time::DATE as query_date
+        ,warehouse_name
+        ,round(sum(est_query_cost), 2) as aprox_credits
+        ,1/count(distinct user_name) as unqiue_user_share
+    from query_warehouse_usage
+    group by start_time::DATE, warehouse_name
+)
+,warehouse_credits as (
+    select start_time::DATE as wh_date,
+    warehouse_name,
+    round(sum(credits_used), 2) as credits_used
+    from snowflake.account_usage.warehouse_metering_history
+    where warehouse_name <> 'CLOUD_SERVICES_ONLY'
+    group by start_time::DATE, warehouse_name
+)
+,warehouse_adjusted_usage as (
+    select 
+    whc.wh_date
+    ,whc.warehouse_name
+    ,whc.credits_used - whs.aprox_credits as gap
+    ,gap * unqiue_user_share as adjustperuser
+    from warehouse_credits as whc
+    inner join warehouse_usage_share as whs on whc.wh_date = whs.query_date
+    AND whc.warehouse_name = whs.warehouse_name
+)
+,query_adjusted_usage as (
+    select 
+        qwu.user_name
+        ,qwu.warehouse_name
+        ,qwu.start_time::DATE as query_date
+        ,round(sum(qwu.est_query_cost), 4) as aprox_credits
+    from query_warehouse_usage as qwu
+    group by qwu.user_name, qwu.warehouse_name, query_date
+)
+,daily_totals as (
+    select
+        qau.query_date,
+        qau.warehouse_name,
+        qau.user_name,
+        sum(round(qau.aprox_credits + wau.adjustperuser, 4)) over (partition by qau.query_date, qau.user_name) as total_credits
+    from warehouse_adjusted_usage as wau
+    join query_adjusted_usage as qau on wau.wh_date = qau.query_date
+    AND wau.warehouse_name = qau.warehouse_name
+    and qau.query_date = :daterange --dateadd(day, -30, getdate())
+)
+select 
+    round(avg(total_credits), 4) as avg_total_credits
+from daily_totals
+;
+
+----------------------------------------------------------------------
+
+--Total Credit Usage By Day (By Warehouse) Visualized
+
+-- total credit usage by day (sliced by warehouse in chart)with query_warehouse_usage as (
+    select
+        usg.start_time
+        ,usg.end_time
+        ,usg.user_name
+        ,usg.role_name
+        ,usg.warehouse_name
+        ,usg.warehouse_size
+        ,usg.total_elapsed_secs
+        ,usg.est_query_cost
+    from (
+        select 
+            qh.start_time
+            ,qh.end_time
+            ,to_char(qh.start_time, 'DD-MON-YYYY')::DATE as start_dt
+            ,to_char(qh.start_time, 'HH24:MI')::TIME as time_slot_min
+            ,to_time(to_char(qh.start_time, 'HH24') || ':00')::TIME as time_slot_hour
+            ,qh.user_name
+            ,qh.role_name
+            ,qh.warehouse_name
+            ,qh.warehouse_size
+            ,wmh.credits_used as total_vwh_credits_per_hour
+            ,round(qh.total_elapsed_time * 1000) as total_elapsed_secs
+            ,ceil(total_elapsed_secs / 60) as query_time_slots --query_time_slots: Number of 1 min slots taken by the query during this window
+            ,sum(query_time_slots) over (partition by qh.warehouse_name, time_slot_hour order by qh.warehouse_name, time_slot_hour) as total_time_slots --total_time_slots: Total Number 1 min slots across all parallel queries running during this window
+            ,query_time_slots / total_time_slots * 100 as est_query_cost_percent --est_query_cost_percent: This Query load on Warehouse during this window
+            ,total_vwh_credits_per_hour * est_query_cost_percent/100 as est_query_cost --est_query_cost: Based on est_query_cost_percent we will allocate WH cost % during this window
+        from snowflake.account_usage.query_history as qh
+        inner join snowflake.account_usage.warehouse_metering_history as wmh on qh.warehouse_id = wmh.warehouse_id
+        where qh.warehouse_size is not null
+        and qh.start_time < wmh.end_time
+        and qh.end_time > wmh.start_time
+        and qh.total_elapsed_time > 0
+        and qh.user_name = current_user()
+        and qh.start_time = :daterange 
+    ) as usg
+)
+,warehouse_usage_share as (
+    select 
+        start_time::DATE as query_date
+        ,warehouse_name
+        ,round(sum(est_query_cost), 2) as aprox_credits
+        ,1/count(distinct user_name) as unqiue_user_share
+    from query_warehouse_usage
+    group by start_time::DATE, warehouse_name
+)
+,warehouse_credits as (
+    select start_time::DATE as wh_date,
+    warehouse_name,
+    round(sum(credits_used), 2) as credits_used
+    from snowflake.account_usage.warehouse_metering_history
+    where warehouse_name <> 'CLOUD_SERVICES_ONLY'
+    group by start_time::DATE, warehouse_name
+)
+,warehouse_adjusted_usage as (
+    select 
+    whc.wh_date
+    ,whc.warehouse_name
+    ,whc.credits_used - whs.aprox_credits as gap
+    ,gap * unqiue_user_share as adjustperuser
+    from warehouse_credits as whc
+    inner join warehouse_usage_share as whs on whc.wh_date = whs.query_date
+    AND whc.warehouse_name = whs.warehouse_name
+)
+,query_adjusted_usage as (
+    select 
+        qwu.user_name
+        ,qwu.warehouse_name
+        ,qwu.start_time::DATE as query_date
+        ,round(sum(qwu.est_query_cost), 4) as aprox_credits
+    from query_warehouse_usage as qwu
+    group by qwu.user_name, qwu.warehouse_name, query_date
+)
+select 
+    qau.query_date
+    ,qau.warehouse_name
+    ,qau.user_name
+    ,sum(round(qau.aprox_credits + wau.adjustperuser, 4)) over (partition by qau.query_date, qau.warehouse_name, qau.user_name) AS total_credits
+from warehouse_adjusted_usage as wau
+join query_adjusted_usage as qau on wau.wh_date = qau.query_date
+and wau.warehouse_name = qau.warehouse_name
+and qau.query_date = :daterange -->= dateadd(day, -30, getdate())
+order by qau.query_date desc, total_credits desc;
+
+
+--------------------------------------------------------------------
+
+--Execution Time Averaged By Query Type
+
+select
+    qh.query_type
+    ,qh.warehouse_size
+    ,round(avg(qh.execution_time) / 1000, 2) as average_execution_time
+from snowflake.account_usage.query_history as qh
+where start_time::date = :daterange --dateadd(day, -30, getdate()) --> dateadd('days', -30, getdate())
+and qh.user_name = current_user()
+group by 1, 2
+order by average_execution_time desc;
+
+--------------------------------------------------------------------
+
+--Top 25 Longest Queries (in execution time minutes)
+
+select top 25
+    qh.query_id
+    ,qh.query_text
+    ,(qh.execution_time / 60000) as execution_time
+from account_usage.query_history as qh
+where execution_status = 'SUCCESS'
+and start_time::date = :daterange --> dateadd('days', -30, getdate())
+and qh.user_name = current_user() 
+order by execution_time desc
+;
+
+--------------------------------------------------------------------
+
+--Top Credit Usage By Repeated Queries
+
+WITH
+filtered_queries AS (
+    SELECT
+        query_id,
+        user_name,
+        query_text AS original_query_text,
+
+        -- First, we remove comments enclosed by /* <comment text> */
+        REGEXP_REPLACE(query_text, '(/\*.*\*/)') AS _cleaned_query_text,
+        -- Next, removes single line comments starting with --
+        -- and either ending with a new line or end of string
+        REGEXP_REPLACE(_cleaned_query_text, '(--.*$)|(--.*\n)') AS cleaned_query_text,
+        warehouse_id,
+        TIMEADD(
+            'millisecond',
+            queued_overload_time + compilation_time +
+            queued_provisioning_time + queued_repair_time +
+            list_external_files_time,
+            start_time
+        ) AS execution_start_time,
+        end_time
+    FROM snowflake.account_usage.query_history AS q
+    WHERE TRUE
+        AND warehouse_size IS NOT NULL
+        AND start_time = :daterange -->= DATEADD('day', -30, DATEADD('day', -1, CURRENT_DATE))
+),
+-- 1 row per hour from 30 days ago until the end of today
+hours_list AS (
+    SELECT
+        DATEADD(
+            'hour',
+            '-' || row_number() over (order by null),
+            DATEADD('day', '+1', CURRENT_DATE)
+        ) as hour_start,
+        DATEADD('hour', '+1', hour_start) AS hour_end
+    FROM TABLE(generator(rowcount => (24*31))) t
+),
+-- 1 row per hour a query ran
+query_hours AS (
+    SELECT
+        hl.hour_start,
+        hl.hour_end,
+        queries.*
+    FROM hours_list AS hl
+    INNER JOIN filtered_queries AS queries
+        ON hl.hour_start >= DATE_TRUNC('hour', queries.execution_start_time)
+        AND hl.hour_start < queries.end_time
+),
+query_seconds_per_hour AS (
+    SELECT
+        *,
+        DATEDIFF('millisecond', GREATEST(execution_start_time, hour_start), LEAST(end_time, hour_end)) AS num_milliseconds_query_ran,
+        SUM(num_milliseconds_query_ran) OVER (PARTITION BY warehouse_id, hour_start) AS total_query_milliseconds_in_hour,
+        num_milliseconds_query_ran/total_query_milliseconds_in_hour AS fraction_of_total_query_time_in_hour,
+        hour_start AS hour
+    FROM query_hours
+),
+credits_billed_per_hour AS (
+    SELECT
+        start_time AS hour,
+        warehouse_id,
+        warehouse_name,
+        credits_used_compute
+    FROM snowflake.account_usage.warehouse_metering_history
+),
+query_cost AS (
+    SELECT
+        query.*,
+        credits.credits_used_compute*2.28 AS actual_warehouse_cost,
+        credits.credits_used_compute*fraction_of_total_query_time_in_hour*2.28 AS query_allocated_cost_in_hour,
+        credits.warehouse_name
+    FROM query_seconds_per_hour AS query
+    INNER JOIN credits_billed_per_hour AS credits
+        ON query.warehouse_id=credits.warehouse_id
+        AND query.hour=credits.hour
+),
+cost_per_query AS (
+    SELECT
+        query_id,
+        user_name,
+        ANY_VALUE(MD5(cleaned_query_text)) AS query_signature,
+        SUM(query_allocated_cost_in_hour) AS query_cost,
+        ANY_VALUE(original_query_text) AS original_query_text,
+        ANY_VALUE(warehouse_id) AS warehouse_id,
+        ANY_VALUE(warehouse_name) as warehouse_name,
+        SUM(num_milliseconds_query_ran) / 1000 AS execution_time_s
+    FROM query_cost
+    GROUP BY 1, 2
+)
+SELECT top 50
+    user_name,
+    --query_signature,
+    ANY_VALUE(warehouse_name) as warehouse_name,
+    COUNT(*) AS num_executions,
+    AVG(query_cost) AS avg_cost_per_execution,
+    SUM(query_cost) AS total_cost_last_time_period,
+    ANY_VALUE(original_query_text) AS sample_query_text
+FROM cost_per_query
+where user_name = CURRENT_USER()
+GROUP BY 1, query_signature
+order by total_cost_last_time_period desc
+;
+
+--------------------------------------------------------------------
+
+--Queries With Full Table Scans
+
+--queries with (near) full table scans
+select
+    user_name
+    ,start_time
+    ,end_time
+    ,round(partitions_scanned / partitions_total, 2) * 100 as percent_table_partitions_scanned
+    ,query_text
+from snowflake.account_usage.query_history
+where start_time::date = :daterange --> dateadd('days', -30, current_date)
+and partitions_scanned > (partitions_total * 0.95)
+and query_type not like 'CREATE%'
+and partitions_total > 0
+and user_name = current_user()
+order by start_time desc;
+
+--------------------------------------------------------------------
+
+-- Heavy Query Partition Scanning By Warehouse (vs an organization average)
+
+with warehouse_average_all as (
+    select 
+        warehouse_name
+        ,avg(case when partitions_total > 0 then partitions_scanned / partitions_total else 0 end) as avg_pct_scanned
+    from snowflake.account_usage.query_history
+    where start_time::date = :daterange -- > dateadd('days', -30, getdate())
+    and warehouse_name is not null
+    group by warehouse_name
+)
+select 
+    qh.user_name
+    ,qh.warehouse_name
+    ,round(avg(case when qh.partitions_total > 0 then qh.partitions_scanned / qh.partitions_total else 0 end), 4) as user_avg_query_pct_scanned
+    ,round(waa.avg_pct_scanned, 4) as org_avg_query_pct_scanned
+from snowflake.account_usage.query_history as qh
+left join warehouse_average_all waa on waa.warehouse_name = qh.warehouse_name
+where start_time::date = :daterange -- > dateadd('days', -30, getdate())
+and qh.warehouse_name is not null
+and qh.user_name = current_user()
+group by qh.user_name, qh.warehouse_name, waa.avg_pct_scanned
+order by user_avg_query_pct_scanned desc
+;
+
+--------------------------------------------------------------------
+
+--Information on Roles and Warehouses Used
+
+--get roles used for visibility of resources being used/available to users
+select role_type, role_name, max(start_time::date) as last_used_date
+FROM snowflake.account_usage.query_history 
+where user_name = current_user() 
+and start_time::date = :daterange -->= dateadd(day, -30, getdate())
+group by role_type, role_name
+order by last_used_date desc
+;
+
+--get warehousehouses used for visibility of resources being used/available to roles assigned
+select warehouse_name, warehouse_size, max(start_time::date) as last_used_date
+FROM snowflake.account_usage.query_history 
+where user_name = current_user() 
+and warehouse_name is not null and warehouse_size is not null
+and start_time::date = :daterange -->= dateadd(day, -30, getdate())
+group by warehouse_name, warehouse_size
+order by last_used_date desc;
